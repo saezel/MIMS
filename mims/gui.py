@@ -1342,16 +1342,25 @@ class MetadataManagerApp(ttk.Frame):
         self._apply_display_columns()
         self.status_var.set("Columns reordered.")
 
+    def _scroll_table_to_top(self) -> None:
+        self.tree.update_idletasks()
+        self.tree.yview_moveto(0)
+        children = self.tree.get_children("")
+        if children:
+            self.tree.see(children[0])
+
     def prev_page(self) -> None:
         if self.state.page > 1:
             self.state.page -= 1
             self.load_page(reset_count=False)
+            self._scroll_table_to_top()
 
     def next_page(self) -> None:
         total_pages = max(1, math.ceil(self.state.total_rows / self.state.page_size))
         if self.state.page < total_pages:
             self.state.page += 1
             self.load_page(reset_count=False)
+            self._scroll_table_to_top()
 
     def close(self) -> None:
         if self.conn is not None:
