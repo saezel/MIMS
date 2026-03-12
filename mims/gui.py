@@ -324,6 +324,9 @@ class RecordDialog(tk.Toplevel):
         self.destroy()
 
 
+MAX_FILTER_RULES = 20
+
+
 class AdvancedFiltersDialog(tk.Toplevel):
     def __init__(self, master: tk.Misc, initial_rules: list[dict[str, str]] | None = None) -> None:
         super().__init__(master)
@@ -359,7 +362,7 @@ class AdvancedFiltersDialog(tk.Toplevel):
         ttk.Button(actions, text="Apply", command=self._apply).grid(row=0, column=0, padx=4)
         ttk.Button(actions, text="Cancel", command=self.destroy).grid(row=0, column=1, padx=4)
 
-        rules_to_load = initial_rules or [{"column": "filesize_bytes", "operator": ">", "value": "0", "unit": "B"}]
+        rules_to_load = list(initial_rules or [])[:MAX_FILTER_RULES]
         for rule in rules_to_load:
             self.add_rule(rule)
 
@@ -369,6 +372,9 @@ class AdvancedFiltersDialog(tk.Toplevel):
         self.focus_force()
 
     def add_rule(self, initial: dict[str, str] | None = None) -> None:
+        if len(self.rule_rows) >= MAX_FILTER_RULES:
+            messagebox.showinfo("Rule limit reached", f"You can add up to {MAX_FILTER_RULES} filter rules.", parent=self)
+            return
         initial = initial or {}
         selected_column = initial.get("column", "filesize_bytes")
         display_label = next((label for label, value in FILTER_COLUMNS.items() if value == selected_column), "Filesize")
@@ -428,9 +434,6 @@ class AdvancedFiltersDialog(tk.Toplevel):
             if widget is not None:
                 widget.destroy()
         self.rule_rows.remove(row)
-        if not self.rule_rows:
-            self.add_rule()
-            return
         self._layout_rule_rows()
 
     def _layout_rule_rows(self) -> None:
@@ -462,33 +465,29 @@ class AdvancedFiltersDialog(tk.Toplevel):
 
     def _apply(self) -> None:
         rules: list[dict[str, str]] = []
-        for row in self.rule_rows:
+        for row in self.rule_rows[:MAX_FILTER_RULES]:
             label = str(row["column_var"].get()).strip()
             column = FILTER_COLUMNS.get(label, "")
             operator = str(row["operator_var"].get()).strip()
             value = str(row["value_var"].get()).strip()
             unit_label = str(row["unit_var"].get()).strip() or "( B) Bytes"
             unit_symbol = FILESIZE_UNIT_LABEL_TO_SYMBOL.get(unit_label, "B")
+
             if not column or not operator:
-                messagebox.showerror("Filter error", "Each rule needs a column and an operator.", parent=self)
-                return
+                continue
+            if operator not in {"is empty", "is not empty"} and value == "":
+                continue
             if column in INTEGER_FILTER_COLUMNS and operator not in {"is empty", "is not empty"}:
                 try:
                     int(value)
                 except ValueError:
-                    messagebox.showerror(
-                        "Filter error",
-                        f"{label} filters require an integer value.",
-                        parent=self,
-                    )
-                    return
-            if column not in INTEGER_FILTER_COLUMNS and operator not in {"is empty", "is not empty"} and value == "":
-                messagebox.showerror("Filter error", f"{label} rules need a value.", parent=self)
-                return
+                    continue
+
             rule = {"column": column, "operator": operator, "value": value}
             if column == "filesize_bytes":
                 rule["unit"] = unit_symbol
             rules.append(rule)
+
         self.result = rules
         self.destroy()
 
@@ -817,7 +816,7 @@ class MetadataManagerApp(ttk.Frame):
         else:
             self.state.sort_column = column
             self.state.sort_desc = False
-        self.load_page(reset_count=False)
+        self.load_page(reset_count=True)
 
     def load_page(self, *, reset_count: bool) -> None:
         if self.conn is None:
