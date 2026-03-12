@@ -19,6 +19,7 @@ from .db import (
     delete_category_definition,
     delete_record,
     fetch_records,
+    get_record_by_id,
     init_db,
     list_categories,
     update_record,
@@ -63,8 +64,55 @@ SEARCH_SCOPE_LABEL_TO_VALUE = {
     "Title": "title",
 }
 SEARCH_SCOPE_VALUE_TO_LABEL = {value: label for label, value in SEARCH_SCOPE_LABEL_TO_VALUE.items()}
+FILESIZE_UNIT_LABELS = (
+    "(PB) Petabytes",
+    "(TB) Terabytes",
+    "(GB) Gigabytes",
+    "(MB) Megabytes",
+    "(KB) Kilobytes",
+    "( B) Bytes",
+)
+FILESIZE_UNIT_LABEL_TO_SYMBOL = {
+    "(PB) Petabytes": "PB",
+    "(TB) Terabytes": "TB",
+    "(GB) Gigabytes": "GB",
+    "(MB) Megabytes": "MB",
+    "(KB) Kilobytes": "KB",
+    "( B) Bytes": "B",
+}
+FILESIZE_UNIT_SYMBOL_TO_LABEL = {value: key for key, value in FILESIZE_UNIT_LABEL_TO_SYMBOL.items()}
 
 SortColumn = Literal["id", "category", "source_title", "title", "filesize_bytes", "info_hash", "resource_link"]
+
+
+def format_filesize(value: object) -> str:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if size == 0:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    display = float(size)
+    unit_index = 0
+    while display >= 1000 and unit_index < len(units) - 1:
+        display /= 1000.0
+        unit_index += 1
+    number = f"{display:.3f}".rstrip("0").rstrip(".")
+    return f"{number} {units[unit_index]}"
+
+
+def filter_rule_summary(rule: dict[str, str]) -> str:
+    column = rule.get("column", "")
+    operator = rule.get("operator", "")
+    value = (rule.get("value", "") or "").strip()
+    label = COLUMN_HEADINGS.get(column, column or "Field")
+    if operator in {"is empty", "is not empty"}:
+        return f"{label} {operator}"
+    if column == "filesize_bytes" and value:
+        unit = (rule.get("unit", "B") or "B").strip().upper()
+        return f"{label} {operator} {value} {unit}".strip()
+    return f"{label} {operator} {value}".strip()
 
 
 @dataclass(slots=True)
@@ -77,9 +125,7 @@ class AppState:
     sort_column: SortColumn = "title"
     sort_desc: bool = False
     total_rows: int = 0
-    filter_column: str = ""
-    filter_operator: str = ""
-    filter_value: str = ""
+    filter_rules: list[dict[str, str]] | None = None
 
 
 class CategoryManagerDialog(tk.Toplevel):
@@ -278,6 +324,175 @@ class RecordDialog(tk.Toplevel):
         self.destroy()
 
 
+class AdvancedFiltersDialog(tk.Toplevel):
+    def __init__(self, master: tk.Misc, initial_rules: list[dict[str, str]] | None = None) -> None:
+        super().__init__(master)
+        self.title("Advanced Filters")
+        self.resizable(True, False)
+        self.transient(master)
+        self.grab_set()
+        self.result: list[dict[str, str]] | None = None
+        self.rule_rows: list[dict[str, object]] = []
+
+        frame = ttk.Frame(self, padding=12)
+        frame.grid(sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Add one or more rules. All rules are applied together with AND logic.",
+        ).grid(row=0, column=0, sticky="w")
+
+        self.rules_container = ttk.Frame(frame)
+        self.rules_container.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.rules_container.columnconfigure(2, weight=1)
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        button_row.columnconfigure(1, weight=1)
+
+        ttk.Button(button_row, text="Add Rule", command=self.add_rule).grid(row=0, column=0, sticky="w")
+
+        actions = ttk.Frame(button_row)
+        actions.grid(row=0, column=2, sticky="e")
+        ttk.Button(actions, text="Apply", command=self._apply).grid(row=0, column=0, padx=4)
+        ttk.Button(actions, text="Cancel", command=self.destroy).grid(row=0, column=1, padx=4)
+
+        rules_to_load = initial_rules or [{"column": "filesize_bytes", "operator": ">", "value": "0", "unit": "B"}]
+        for rule in rules_to_load:
+            self.add_rule(rule)
+
+        self.bind("<Return>", lambda _e: self._apply())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.wait_visibility()
+        self.focus_force()
+
+    def add_rule(self, initial: dict[str, str] | None = None) -> None:
+        initial = initial or {}
+        selected_column = initial.get("column", "filesize_bytes")
+        display_label = next((label for label, value in FILTER_COLUMNS.items() if value == selected_column), "Filesize")
+        initial_unit = (initial.get("unit", "B") or "B").strip().upper()
+        if initial_unit not in FILESIZE_UNIT_SYMBOL_TO_LABEL:
+            initial_unit = "B"
+
+        row: dict[str, object] = {
+            "column_var": tk.StringVar(value=display_label),
+            "operator_var": tk.StringVar(value=initial.get("operator", ">")),
+            "value_var": tk.StringVar(value=initial.get("value", "")),
+            "unit_var": tk.StringVar(value=FILESIZE_UNIT_SYMBOL_TO_LABEL[initial_unit]),
+        }
+
+        row["label"] = ttk.Label(self.rules_container, text="")
+        row["field_combo"] = ttk.Combobox(
+            self.rules_container,
+            width=16,
+            textvariable=row["column_var"],
+            values=list(FILTER_COLUMNS.keys()),
+            state="readonly",
+        )
+        row["operator_combo"] = ttk.Combobox(
+            self.rules_container,
+            width=14,
+            textvariable=row["operator_var"],
+            state="readonly",
+        )
+        row["value_entry"] = ttk.Entry(self.rules_container, textvariable=row["value_var"])
+        row["unit_combo"] = ttk.Combobox(
+            self.rules_container,
+            width=18,
+            textvariable=row["unit_var"],
+            values=FILESIZE_UNIT_LABELS,
+            state="readonly",
+        )
+        row["remove_button"] = ttk.Button(
+            self.rules_container,
+            text="Remove",
+            command=lambda r=row: self.remove_rule(r),
+        )
+
+        def on_column_change(_event=None, rule_row=row) -> None:
+            self._refresh_rule_operator_choices(rule_row)
+
+        row["field_combo"].bind("<<ComboboxSelected>>", on_column_change)
+
+        self.rule_rows.append(row)
+        self._layout_rule_rows()
+        self._refresh_rule_operator_choices(row)
+
+    def remove_rule(self, row: dict[str, object]) -> None:
+        if row not in self.rule_rows:
+            return
+        for widget_key in ("label", "field_combo", "operator_combo", "value_entry", "unit_combo", "remove_button"):
+            widget = row.get(widget_key)
+            if widget is not None:
+                widget.destroy()
+        self.rule_rows.remove(row)
+        if not self.rule_rows:
+            self.add_rule()
+            return
+        self._layout_rule_rows()
+
+    def _layout_rule_rows(self) -> None:
+        for index, row in enumerate(self.rule_rows):
+            row["label"].configure(text=f"Rule {index + 1}")
+            row["label"].grid(row=index, column=0, sticky="w", padx=(0, 8), pady=4)
+            row["field_combo"].grid(row=index, column=1, sticky="w", padx=(0, 8), pady=4)
+            row["operator_combo"].grid(row=index, column=2, sticky="w", padx=(0, 8), pady=4)
+            row["value_entry"].grid(row=index, column=3, sticky="ew", padx=(0, 8), pady=4)
+            row["unit_combo"].grid(row=index, column=4, sticky="w", padx=(0, 8), pady=4)
+            row["remove_button"].grid(row=index, column=5, sticky="w", pady=4)
+        self.rules_container.columnconfigure(3, weight=1)
+
+    def _refresh_rule_operator_choices(self, row: dict[str, object]) -> None:
+        selected_label = str(row["column_var"].get()).strip() or "Filesize"
+        column = FILTER_COLUMNS.get(selected_label, "filesize_bytes")
+        values = NUMBER_FILTER_OPERATORS if column in INTEGER_FILTER_COLUMNS else TEXT_FILTER_OPERATORS
+        operator_combo = row["operator_combo"]
+        operator_combo.configure(values=values)
+        current_operator = str(row["operator_var"].get()).strip()
+        if current_operator not in values:
+            row["operator_var"].set(values[0])
+
+        unit_combo = row["unit_combo"]
+        if column == "filesize_bytes":
+            unit_combo.grid()
+        else:
+            unit_combo.grid_remove()
+
+    def _apply(self) -> None:
+        rules: list[dict[str, str]] = []
+        for row in self.rule_rows:
+            label = str(row["column_var"].get()).strip()
+            column = FILTER_COLUMNS.get(label, "")
+            operator = str(row["operator_var"].get()).strip()
+            value = str(row["value_var"].get()).strip()
+            unit_label = str(row["unit_var"].get()).strip() or "( B) Bytes"
+            unit_symbol = FILESIZE_UNIT_LABEL_TO_SYMBOL.get(unit_label, "B")
+            if not column or not operator:
+                messagebox.showerror("Filter error", "Each rule needs a column and an operator.", parent=self)
+                return
+            if column in INTEGER_FILTER_COLUMNS and operator not in {"is empty", "is not empty"}:
+                try:
+                    int(value)
+                except ValueError:
+                    messagebox.showerror(
+                        "Filter error",
+                        f"{label} filters require an integer value.",
+                        parent=self,
+                    )
+                    return
+            if column not in INTEGER_FILTER_COLUMNS and operator not in {"is empty", "is not empty"} and value == "":
+                messagebox.showerror("Filter error", f"{label} rules need a value.", parent=self)
+                return
+            rule = {"column": column, "operator": operator, "value": value}
+            if column == "filesize_bytes":
+                rule["unit"] = unit_symbol
+            rules.append(rule)
+        self.result = rules
+        self.destroy()
+
+
 class MetadataManagerApp(ttk.Frame):
     def __init__(self, master: tk.Tk, db_path: str | None = None) -> None:
         super().__init__(master, padding=10)
@@ -294,9 +509,7 @@ class MetadataManagerApp(ttk.Frame):
         self.import_result: tuple[bool, str] | None = None
         self.import_progress_queue: queue.Queue[dict[str, int]] = queue.Queue()
 
-        self.filter_column_var = tk.StringVar(value="Filesize")
-        self.filter_operator_var = tk.StringVar(value=">")
-        self.filter_value_var = tk.StringVar(value="")
+        self.filter_summary_var = tk.StringVar(value="Filters: none")
 
         self.column_order = list(ALL_COLUMNS)
         self.visible_columns = set(ALL_COLUMNS)
@@ -308,8 +521,8 @@ class MetadataManagerApp(ttk.Frame):
 
         self.grid(sticky="nsew")
         self._build_ui()
-        self._refresh_filter_operator_choices()
         self._rebuild_column_menu()
+        self._refresh_filter_summary()
         if self.db_path_var.get().strip():
             self.open_database(self.db_path_var.get())
         else:
@@ -383,36 +596,29 @@ class MetadataManagerApp(ttk.Frame):
 
         toolbar = ttk.LabelFrame(self, text="Manage / Filter")
         toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        toolbar.columnconfigure(9, weight=1)
+        toolbar.columnconfigure(7, weight=1)
 
         ttk.Button(toolbar, text="Add", command=self.add_row).grid(row=0, column=0, padx=(8, 4), pady=(8, 6))
         ttk.Button(toolbar, text="Modify", command=self.edit_selected).grid(row=0, column=1, padx=4, pady=(8, 6))
         ttk.Button(toolbar, text="Delete", command=self.delete_selected).grid(row=0, column=2, padx=4, pady=(8, 6))
         ttk.Button(toolbar, text="Assign Category", command=self.assign_category_to_selection).grid(row=0, column=3, padx=4, pady=(8, 6))
         ttk.Button(toolbar, text="Manage Categories", command=self.manage_categories).grid(row=0, column=4, padx=4, pady=(8, 6))
-        ttk.Button(toolbar, text="Copy Link", command=self.copy_selected_link).grid(row=0, column=5, padx=(4, 8), pady=(8, 6))
+        ttk.Button(toolbar, text="Copy Link", command=self.copy_selected_link).grid(row=0, column=5, padx=4, pady=(8, 6))
+        ttk.Button(toolbar, text="Advanced Filters...", command=self.open_advanced_filters).grid(row=0, column=6, padx=(4, 4), pady=(8, 6))
+        ttk.Button(toolbar, text="Clear Filters", command=self.clear_filters).grid(row=0, column=7, padx=(4, 8), pady=(8, 6), sticky="w")
 
-        ttk.Label(toolbar, text="Filter:").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=(0, 8))
-        self.filter_column_combo = ttk.Combobox(
-            toolbar,
-            width=16,
-            textvariable=self.filter_column_var,
-            values=list(FILTER_COLUMNS.keys()),
-            state="readonly",
-        )
-        self.filter_column_combo.grid(row=1, column=1, sticky="w", pady=(0, 8))
-        self.filter_column_combo.bind("<<ComboboxSelected>>", self._on_filter_column_changed)
-
-        self.filter_operator_combo = ttk.Combobox(toolbar, width=14, textvariable=self.filter_operator_var, state="readonly")
-        self.filter_operator_combo.grid(row=1, column=2, sticky="w", padx=4, pady=(0, 8))
-
-        ttk.Entry(toolbar, textvariable=self.filter_value_var).grid(row=1, column=3, columnspan=2, sticky="ew", padx=4, pady=(0, 8))
-        ttk.Button(toolbar, text="Apply Filter", command=self.apply_filter).grid(row=1, column=5, padx=4, pady=(0, 8))
-        ttk.Button(toolbar, text="Clear Filter", command=self.clear_filter).grid(row=1, column=6, padx=4, pady=(0, 8))
-        ttk.Label(toolbar, text="Right-click rows for copy/delete. Right-click the header or blank table area to show/hide columns. Drag headers to reorder.").grid(
+        ttk.Label(toolbar, textvariable=self.filter_summary_var).grid(
             row=1,
-            column=7,
-            columnspan=3,
+            column=0,
+            columnspan=8,
+            sticky="w",
+            padx=(8, 8),
+            pady=(0, 4),
+        )
+        ttk.Label(toolbar, text="Right-click rows for copy/delete. Right-click the header or blank table area to show/hide columns. Drag headers to reorder.").grid(
+            row=2,
+            column=0,
+            columnspan=8,
             sticky="w",
             padx=(8, 8),
             pady=(0, 8),
@@ -576,48 +782,29 @@ class MetadataManagerApp(ttk.Frame):
         self.state.page = 1
         self.load_page(reset_count=True)
 
-    def _on_filter_column_changed(self, _event=None) -> None:
-        self._refresh_filter_operator_choices()
-
-    def _refresh_filter_operator_choices(self) -> None:
-        selected_label = self.filter_column_var.get().strip() or "Filesize"
-        column = FILTER_COLUMNS.get(selected_label, "filesize_bytes")
-        values = NUMBER_FILTER_OPERATORS if column in INTEGER_FILTER_COLUMNS else TEXT_FILTER_OPERATORS
-        self.filter_operator_combo.configure(values=values)
-        if self.filter_operator_var.get() not in values:
-            self.filter_operator_var.set(values[0])
-
-    def apply_filter(self) -> None:
-        column_label = self.filter_column_var.get().strip()
-        column = FILTER_COLUMNS.get(column_label, "")
-        operator = self.filter_operator_var.get().strip()
-        value = self.filter_value_var.get().strip()
-
-        if not column or not operator:
-            messagebox.showerror("Filter error", "Choose a filter column and operator.")
+    def open_advanced_filters(self) -> None:
+        dialog = AdvancedFiltersDialog(self.master, initial_rules=list(self.state.filter_rules or []))
+        self.master.wait_window(dialog)
+        if dialog.result is None:
             return
-        if column in INTEGER_FILTER_COLUMNS and operator not in {"is empty", "is not empty"}:
-            try:
-                int(value)
-            except ValueError:
-                messagebox.showerror("Filter error", "Numeric filters require an integer value.")
-                return
-
-        self.state.filter_column = column
-        self.state.filter_operator = operator
-        self.state.filter_value = value
+        self.state.filter_rules = dialog.result
+        self._refresh_filter_summary()
         self.state.page = 1
         self.load_page(reset_count=True)
 
-    def clear_filter(self) -> None:
-        self.state.filter_column = ""
-        self.state.filter_operator = ""
-        self.state.filter_value = ""
-        self.filter_column_var.set("Filesize")
-        self._refresh_filter_operator_choices()
-        self.filter_value_var.set("")
+    def clear_filters(self) -> None:
+        self.state.filter_rules = []
+        self._refresh_filter_summary()
         self.state.page = 1
         self.load_page(reset_count=True)
+
+    def _refresh_filter_summary(self) -> None:
+        rules = self.state.filter_rules or []
+        if not rules:
+            self.filter_summary_var.set("Filters: none")
+            return
+        pieces = [filter_rule_summary(rule) for rule in rules]
+        self.filter_summary_var.set("Filters: " + " AND ".join(pieces))
 
     def _on_page_size_changed(self, _event=None) -> None:
         self.state.page_size = int(self.page_size_var.get())
@@ -643,9 +830,7 @@ class MetadataManagerApp(ttk.Frame):
                     search=self.state.search,
                     search_mode=self.state.search_mode,
                     search_field=self.state.search_field,
-                    filter_column=self.state.filter_column,
-                    filter_operator=self.state.filter_operator,
-                    filter_value=self.state.filter_value,
+                    filter_rules=self.state.filter_rules or [],
                 )
 
             total_pages = max(1, math.ceil(self.state.total_rows / self.state.page_size))
@@ -661,9 +846,7 @@ class MetadataManagerApp(ttk.Frame):
                 sort_desc=self.state.sort_desc,
                 limit=self.state.page_size,
                 offset=offset,
-                filter_column=self.state.filter_column,
-                filter_operator=self.state.filter_operator,
-                filter_value=self.state.filter_value,
+                filter_rules=self.state.filter_rules or [],
             )
         except ValueError as exc:
             messagebox.showerror("Filter error", str(exc))
@@ -680,7 +863,7 @@ class MetadataManagerApp(ttk.Frame):
                     row["category"] or "",
                     row["source_title"] or "",
                     row["title"],
-                    row["filesize_bytes"],
+                    format_filesize(row["filesize_bytes"]),
                     row["info_hash"],
                     row["resource_link"],
                 ),
@@ -705,13 +888,10 @@ class MetadataManagerApp(ttk.Frame):
         return f"{self.state.search_mode} words in {field_label}: {self.state.search}"
 
     def _current_filter_summary(self) -> str:
-        if not self.state.filter_column or not self.state.filter_operator:
+        rules = self.state.filter_rules or []
+        if not rules:
             return "none"
-        label = COLUMN_HEADINGS.get(self.state.filter_column, self.state.filter_column)
-        value = self.state.filter_value
-        if self.state.filter_operator in {"is empty", "is not empty"}:
-            return f"{label} {self.state.filter_operator}"
-        return f"{label} {self.state.filter_operator} {value}"
+        return " AND ".join(filter_rule_summary(rule) for rule in rules)
 
     def get_selected_ids(self) -> list[int]:
         return [int(item_id) for item_id in self.tree.selection()]
@@ -752,17 +932,21 @@ class MetadataManagerApp(ttk.Frame):
             return
 
         record_id = selected_ids[0]
-        values = self.tree.item(str(record_id), "values")
+        record = get_record_by_id(self.conn, record_id)
+        if record is None:
+            messagebox.showerror("Modify failed", "The selected row no longer exists.")
+            self.load_page(reset_count=True)
+            return
         dialog = RecordDialog(
             self.master,
             "Modify metadata entry",
             self.category_cache,
             initial={
-                "category": str(values[1]),
-                "source_title": str(values[2]),
-                "title": str(values[3]),
-                "filesize_bytes": str(values[4]),
-                "info_hash": str(values[5]),
+                "category": str(record["category"] or ""),
+                "source_title": str(record["source_title"] or ""),
+                "title": str(record["title"]),
+                "filesize_bytes": str(record["filesize_bytes"]),
+                "info_hash": str(record["info_hash"]),
             },
         )
         self.master.wait_window(dialog)
@@ -1006,8 +1190,10 @@ class MetadataManagerApp(ttk.Frame):
     def _show_column_menu(self, event: tk.Event) -> None:
         if self.column_menu is None:
             self._rebuild_column_menu()
+        self._refresh_filter_summary()
         # refresh check states on every open
         self._rebuild_column_menu()
+        self._refresh_filter_summary()
         assert self.column_menu is not None
         self.column_menu.tk_popup(event.x_root, event.y_root)
 

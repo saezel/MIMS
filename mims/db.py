@@ -25,6 +25,14 @@ FILTERABLE_COLUMNS = {
     "info_hash": "text",
     "resource_link": "text",
 }
+FILESIZE_UNIT_MULTIPLIERS = {
+    "B": 1,
+    "KB": 1000,
+    "MB": 1000**2,
+    "GB": 1000**3,
+    "TB": 1000**4,
+    "PB": 1000**5,
+}
 
 
 def sanitize_text(value: str | None) -> str:
@@ -271,6 +279,13 @@ def delete_record(conn: sqlite3.Connection, record_id: int) -> None:
     conn.commit()
 
 
+def get_record_by_id(conn: sqlite3.Connection, record_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, category, source_title, title, filesize_bytes, info_hash, resource_link FROM metadata_index WHERE id = ?",
+        (record_id,),
+    ).fetchone()
+
+
 def fetch_records(
     conn: sqlite3.Connection,
     *,
@@ -284,6 +299,7 @@ def fetch_records(
     filter_column: str = "",
     filter_operator: str = "",
     filter_value: str = "",
+    filter_rules: Sequence[dict[str, str]] | None = None,
 ) -> list[sqlite3.Row]:
     sort_sql = ALLOWED_SORT_COLUMNS.get(sort_column, "title")
     sort_dir = "DESC" if sort_desc else "ASC"
@@ -299,6 +315,7 @@ def fetch_records(
         filter_column=filter_column,
         filter_operator=filter_operator,
         filter_value=filter_value,
+        filter_rules=filter_rules,
     )
     if where_sql:
         base_sql += " WHERE " + " AND ".join(where_sql)
@@ -317,6 +334,7 @@ def count_records(
     filter_column: str = "",
     filter_operator: str = "",
     filter_value: str = "",
+    filter_rules: Sequence[dict[str, str]] | None = None,
 ) -> int:
     sql = "SELECT COUNT(*) FROM metadata_index"
     where_sql, params = _build_where_clauses(
@@ -326,12 +344,36 @@ def count_records(
         filter_column=filter_column,
         filter_operator=filter_operator,
         filter_value=filter_value,
+        filter_rules=filter_rules,
     )
     if where_sql:
         sql += " WHERE " + " AND ".join(where_sql)
 
     row = conn.execute(sql, params).fetchone()
     return int(row[0]) if row else 0
+
+
+def _normalized_filter_rules(
+    *,
+    filter_column: str,
+    filter_operator: str,
+    filter_value: str,
+    filter_rules: Sequence[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    if filter_rules:
+        for rule in filter_rules:
+            column = str(rule.get("column", "")).strip()
+            operator = str(rule.get("operator", "")).strip()
+            value = str(rule.get("value", ""))
+            unit = str(rule.get("unit", "B") or "B").strip().upper()
+            if column and operator:
+                normalized.append({"column": column, "operator": operator, "value": value, "unit": unit})
+        return normalized
+
+    if filter_column and filter_operator:
+        normalized.append({"column": filter_column, "operator": filter_operator, "value": filter_value, "unit": "B"})
+    return normalized
 
 
 def _build_where_clauses(
@@ -342,6 +384,7 @@ def _build_where_clauses(
     filter_column: str,
     filter_operator: str,
     filter_value: str,
+    filter_rules: Sequence[dict[str, str]] | None,
 ) -> tuple[list[str], list[object]]:
     where_clauses: list[str] = []
     params: list[object] = []
@@ -352,13 +395,19 @@ def _build_where_clauses(
             where_clauses.append(search_clause)
             params.extend(search_params)
 
-    column_name = ALLOWED_SORT_COLUMNS.get(filter_column)
-    column_type = FILTERABLE_COLUMNS.get(filter_column)
-    operator = (filter_operator or "").strip().lower()
-    value = (filter_value or "").strip()
-
-    if column_name and column_type and operator:
-        clause, clause_params = _build_filter_clause(column_name, column_type, operator, value)
+    for rule in _normalized_filter_rules(
+        filter_column=filter_column,
+        filter_operator=filter_operator,
+        filter_value=filter_value,
+        filter_rules=filter_rules,
+    ):
+        column_name = ALLOWED_SORT_COLUMNS.get(rule["column"])
+        column_type = FILTERABLE_COLUMNS.get(rule["column"])
+        operator = rule["operator"].strip().lower()
+        value = rule["value"].strip()
+        if not column_name or not column_type or not operator:
+            continue
+        clause, clause_params = _build_filter_clause(column_name, column_type, operator, value, rule.get("unit", "B"))
         if clause:
             where_clauses.append(clause)
             params.extend(clause_params)
@@ -396,7 +445,13 @@ def _build_search_clause(*, search: str, search_mode: str, search_field: str) ->
     return ("(" + joiner.join(per_word_clauses) + ")", params)
 
 
-def _build_filter_clause(column_name: str, column_type: str, operator: str, value: str) -> tuple[str, list[object]]:
+def _build_filter_clause(
+    column_name: str,
+    column_type: str,
+    operator: str,
+    value: str,
+    unit: str = "B",
+) -> tuple[str, list[object]]:
     if operator == "is empty":
         return (f"({column_name} IS NULL OR TRIM(CAST({column_name} AS TEXT)) = '')", [])
     if operator == "is not empty":
@@ -409,6 +464,9 @@ def _build_filter_clause(column_name: str, column_type: str, operator: str, valu
             numeric_value = int(value)
         except ValueError as exc:
             raise ValueError(f"Filter value for {column_name} must be an integer.") from exc
+        if column_name == "filesize_bytes":
+            multiplier = FILESIZE_UNIT_MULTIPLIERS.get((unit or "B").strip().upper(), 1)
+            numeric_value *= multiplier
         if operator in {"=", "!=", "<", "<=", ">", ">="}:
             return (f"{column_name} {operator} ?", [numeric_value])
         return ("", [])
