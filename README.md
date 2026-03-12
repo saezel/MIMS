@@ -1,6 +1,6 @@
 # Metadata Indexing & Management System (MIMS)
 
-MIMS is a Python desktop application for importing metadata from HTML iframe payloads into SQLite and managing the indexed records through a GUI.
+MIMS is a Python desktop application for importing metadata from HTML iframe payloads into SQLite and managing the indexed records through a GUI. (Built for supplementing DMM. If you know, you know.)
 
 ## Clean release behavior
 
