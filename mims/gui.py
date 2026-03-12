@@ -507,6 +507,9 @@ class MetadataManagerApp(ttk.Frame):
         self.import_thread: threading.Thread | None = None
         self.import_result: tuple[bool, str] | None = None
         self.import_progress_queue: queue.Queue[dict[str, int]] = queue.Queue()
+        self.result_cache_max_rows = 5000
+        self._result_cache_signature: tuple[object, ...] | None = None
+        self._result_cache_rows: list[sqlite3.Row] | None = None
 
         self.filter_summary_var = tk.StringVar(value="Filters: none")
 
@@ -704,6 +707,44 @@ class MetadataManagerApp(ttk.Frame):
         if selected:
             self.html_dir_var.set(selected)
 
+    def _invalidate_result_cache(self) -> None:
+        self._result_cache_signature = None
+        self._result_cache_rows = None
+
+    def _current_query_signature(self) -> tuple[object, ...]:
+        normalized_rules = tuple(
+            (
+                str(rule.get("column", "")),
+                str(rule.get("operator", "")),
+                str(rule.get("value", "")),
+                str(rule.get("unit", "B")),
+            )
+            for rule in (self.state.filter_rules or [])
+        )
+        return (
+            self.state.search,
+            self.state.search_mode,
+            self.state.search_field,
+            normalized_rules,
+        )
+
+    def _row_sort_key(self, row: sqlite3.Row, column: str) -> object:
+        value = row[column]
+        if column in {"id", "filesize_bytes"}:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        return str(value or "").casefold()
+
+    def _get_cached_page_rows(self) -> list[sqlite3.Row]:
+        rows = list(self._result_cache_rows or [])
+        rows.sort(key=lambda row: int(row["id"]))
+        rows.sort(key=lambda row: self._row_sort_key(row, self.state.sort_column), reverse=self.state.sort_desc)
+        start = (self.state.page - 1) * self.state.page_size
+        end = start + self.state.page_size
+        return rows[start:end]
+
     def open_database(self, db_path: str) -> None:
         db_path = db_path.strip()
         if not db_path:
@@ -719,6 +760,7 @@ class MetadataManagerApp(ttk.Frame):
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             self.conn = connect(db_path)
             init_db(self.conn)
+            self._invalidate_result_cache()
             self.refresh_categories()
         except Exception as exc:
             self.conn = None
@@ -740,6 +782,7 @@ class MetadataManagerApp(ttk.Frame):
         self.category_cache = list_categories(self.conn)
 
     def _reset_table_view(self) -> None:
+        self._invalidate_result_cache()
         self.tree.delete(*self.tree.get_children())
         self.state.total_rows = 0
         self.state.page = 1
@@ -816,12 +859,14 @@ class MetadataManagerApp(ttk.Frame):
         else:
             self.state.sort_column = column
             self.state.sort_desc = False
-        self.load_page(reset_count=True)
+        self.load_page(reset_count=False)
 
     def load_page(self, *, reset_count: bool) -> None:
         if self.conn is None:
             self._reset_table_view()
             return
+
+        query_signature = self._current_query_signature()
         try:
             if reset_count:
                 self.state.total_rows = count_records(
@@ -831,22 +876,40 @@ class MetadataManagerApp(ttk.Frame):
                     search_field=self.state.search_field,
                     filter_rules=self.state.filter_rules or [],
                 )
+                if self.state.total_rows <= self.result_cache_max_rows:
+                    self._result_cache_rows = fetch_records(
+                        self.conn,
+                        search=self.state.search,
+                        search_mode=self.state.search_mode,
+                        search_field=self.state.search_field,
+                        sort_column="id",
+                        sort_desc=False,
+                        limit=max(self.state.total_rows, 1),
+                        offset=0,
+                        filter_rules=self.state.filter_rules or [],
+                    )
+                    self._result_cache_signature = query_signature
+                else:
+                    self._invalidate_result_cache()
 
             total_pages = max(1, math.ceil(self.state.total_rows / self.state.page_size))
             self.state.page = max(1, min(self.state.page, total_pages))
             offset = (self.state.page - 1) * self.state.page_size
 
-            rows = fetch_records(
-                self.conn,
-                search=self.state.search,
-                search_mode=self.state.search_mode,
-                search_field=self.state.search_field,
-                sort_column=self.state.sort_column,
-                sort_desc=self.state.sort_desc,
-                limit=self.state.page_size,
-                offset=offset,
-                filter_rules=self.state.filter_rules or [],
-            )
+            if self._result_cache_signature == query_signature and self._result_cache_rows is not None:
+                rows = self._get_cached_page_rows()
+            else:
+                rows = fetch_records(
+                    self.conn,
+                    search=self.state.search,
+                    search_mode=self.state.search_mode,
+                    search_field=self.state.search_field,
+                    sort_column=self.state.sort_column,
+                    sort_desc=self.state.sort_desc,
+                    limit=self.state.page_size,
+                    offset=offset,
+                    filter_rules=self.state.filter_rules or [],
+                )
         except ValueError as exc:
             messagebox.showerror("Filter error", str(exc))
             return
@@ -915,6 +978,7 @@ class MetadataManagerApp(ttk.Frame):
             messagebox.showerror("Insert failed", f"Could not insert row:\n{exc}")
             return
         self.refresh_categories()
+        self._invalidate_result_cache()
         self.state.page = 1
         self.status_var.set("Row inserted.")
         self.load_page(reset_count=True)
@@ -965,6 +1029,7 @@ class MetadataManagerApp(ttk.Frame):
             messagebox.showerror("Update failed", f"Could not update row:\n{exc}")
             return
         self.refresh_categories()
+        self._invalidate_result_cache()
         self.status_var.set("Row updated.")
         self.load_page(reset_count=True)
 
@@ -979,6 +1044,7 @@ class MetadataManagerApp(ttk.Frame):
             return
         for record_id in selected_ids:
             delete_record(self.conn, record_id)
+        self._invalidate_result_cache()
         self.status_var.set(f"Deleted {len(selected_ids)} row(s).")
         self.load_page(reset_count=True)
 
@@ -1003,6 +1069,7 @@ class MetadataManagerApp(ttk.Frame):
             return
         updated = assign_category(self.conn, selected_ids, dialog.result)
         self.refresh_categories()
+        self._invalidate_result_cache()
         category_label = dialog.result or "(empty)"
         self.status_var.set(f"Assigned {category_label} to {updated} row(s).")
         self.load_page(reset_count=True)
@@ -1068,6 +1135,7 @@ class MetadataManagerApp(ttk.Frame):
             return
 
         ok, message = result
+        self._invalidate_result_cache()
         self.open_database(self.db_path_var.get())
         self.status_var.set(message)
         if not ok:
