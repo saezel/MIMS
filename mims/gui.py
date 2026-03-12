@@ -301,6 +301,7 @@ class MetadataManagerApp(ttk.Frame):
         self.column_order = list(ALL_COLUMNS)
         self.visible_columns = set(ALL_COLUMNS)
         self.column_menu: tk.Menu | None = None
+        self.row_menu: tk.Menu | None = None
         self.column_visibility_vars: dict[str, tk.BooleanVar] = {}
         self.drag_source_column: str | None = None
         self.category_cache: list[str] = []
@@ -408,7 +409,7 @@ class MetadataManagerApp(ttk.Frame):
         ttk.Entry(toolbar, textvariable=self.filter_value_var).grid(row=1, column=3, columnspan=2, sticky="ew", padx=4, pady=(0, 8))
         ttk.Button(toolbar, text="Apply Filter", command=self.apply_filter).grid(row=1, column=5, padx=4, pady=(0, 8))
         ttk.Button(toolbar, text="Clear Filter", command=self.clear_filter).grid(row=1, column=6, padx=4, pady=(0, 8))
-        ttk.Label(toolbar, text="Right-click the table to show/hide columns. Drag headers to reorder.").grid(
+        ttk.Label(toolbar, text="Right-click rows for copy/delete. Right-click the header or blank table area to show/hide columns. Drag headers to reorder.").grid(
             row=1,
             column=7,
             columnspan=3,
@@ -436,9 +437,11 @@ class MetadataManagerApp(ttk.Frame):
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         self.tree.configure(displaycolumns=self.column_order)
 
-        self.tree.bind("<Button-3>", self._show_column_menu)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
         self.tree.bind("<ButtonPress-1>", self._on_tree_button_press, add="+")
         self.tree.bind("<ButtonRelease-1>", self._on_tree_button_release, add="+")
+        self.tree.bind("<Control-a>", self.select_all_shown_rows)
+        self.tree.bind("<Control-A>", self.select_all_shown_rows)
 
         pager = ttk.Frame(self)
         pager.grid(row=5, column=0, sticky="ew", pady=(8, 0))
@@ -796,18 +799,6 @@ class MetadataManagerApp(ttk.Frame):
         self.status_var.set(f"Deleted {len(selected_ids)} row(s).")
         self.load_page(reset_count=True)
 
-    def copy_selected_link(self) -> None:
-        selected_ids = self.get_selected_ids()
-        if not selected_ids:
-            messagebox.showinfo("No selection", "Select a row first.")
-            return
-        values = self.tree.item(str(selected_ids[0]), "values")
-        resource_link = str(values[6])
-        self.master.clipboard_clear()
-        self.master.clipboard_append(resource_link)
-        self.master.update_idletasks()
-        self.status_var.set("Resource link copied to clipboard.")
-
     def manage_categories(self) -> None:
         if self.conn is None:
             return
@@ -920,6 +911,80 @@ class MetadataManagerApp(ttk.Frame):
             self.status_var.set(
                 f"Importing HTML... files processed: {processed} | rows imported: {rows_imported} | errors: {errors}"
             )
+
+    def select_all_shown_rows(self, _event=None) -> str:
+        visible_ids = self.tree.get_children("")
+        if not visible_ids:
+            self.status_var.set("No shown rows to select.")
+            return "break"
+        self.tree.selection_set(visible_ids)
+        self.tree.focus(visible_ids[0])
+        self.tree.see(visible_ids[0])
+        self.status_var.set(f"Selected {len(visible_ids)} shown row(s).")
+        return "break"
+
+    def _selected_item_ids_in_view_order(self) -> list[str]:
+        selected = set(self.tree.selection())
+        return [item_id for item_id in self.tree.get_children("") if item_id in selected]
+
+    def _copy_selected_field(self, value_index: int, singular_label: str, plural_label: str) -> None:
+        selected_item_ids = self._selected_item_ids_in_view_order()
+        if not selected_item_ids:
+            messagebox.showinfo("No selection", "Select one or more rows first.")
+            return
+        values_to_copy: list[str] = []
+        for item_id in selected_item_ids:
+            row_values = self.tree.item(item_id, "values")
+            if value_index >= len(row_values):
+                continue
+            value = str(row_values[value_index]).strip()
+            if value:
+                values_to_copy.append(value)
+        if not values_to_copy:
+            messagebox.showinfo("Nothing to copy", f"No non-empty {plural_label.lower()} were found in the selection.")
+            return
+        clipboard_text = ", ".join(values_to_copy)
+        self.master.clipboard_clear()
+        self.master.clipboard_append(clipboard_text)
+        self.master.update_idletasks()
+        label = singular_label if len(values_to_copy) == 1 else plural_label
+        self.status_var.set(f"Copied {len(values_to_copy)} {label.lower()} to the clipboard.")
+
+    def copy_selected_link(self) -> None:
+        self._copy_selected_field(6, "link", "links")
+
+    def copy_selected_source_titles(self) -> None:
+        self._copy_selected_field(2, "source title", "source titles")
+
+    def copy_selected_titles(self) -> None:
+        self._copy_selected_field(3, "title", "titles")
+
+    def _rebuild_row_menu(self) -> None:
+        self.row_menu = tk.Menu(self, tearoff=False)
+        self.row_menu.add_command(label="Copy Selected Link(s)", command=self.copy_selected_link)
+        self.row_menu.add_command(label="Copy Selected Source Title(s)", command=self.copy_selected_source_titles)
+        self.row_menu.add_command(label="Copy Selected Title(s)", command=self.copy_selected_titles)
+        self.row_menu.add_separator()
+        self.row_menu.add_command(label="Delete Selected Row(s)", command=self.delete_selected)
+
+    def _on_tree_right_click(self, event: tk.Event) -> None:
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            self._show_column_menu(event)
+            return
+
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.tree.selection():
+                self.tree.selection_set(row_id)
+            self.tree.focus(row_id)
+            if self.row_menu is None:
+                self._rebuild_row_menu()
+            assert self.row_menu is not None
+            self.row_menu.tk_popup(event.x_root, event.y_root)
+            return
+
+        self._show_column_menu(event)
 
     def _rebuild_column_menu(self) -> None:
         self.column_menu = tk.Menu(self, tearoff=False)
